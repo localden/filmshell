@@ -75,7 +75,7 @@ Eight pre-downloaded films in `films/` can be re-processed without API access. T
 npm start -- --match-id 53a98da9-718d-4374-b739-b0ee2e7033ba
 ```
 
-Types: 2 PvP (2 humans), 3 PvE (human + bot — currently broken), 2 Solo (1 human).
+Types: 2 PvP (2 humans), 3 PvE (human + bot), 2 Solo (1 human).
 
 ## Weapon fire events
 
@@ -119,9 +119,50 @@ See full list in the [comment thread](https://github.com/dend/blog-comments/issu
 
 **Validated in film `b49f075b`:** 124 AR fire events (slot 1) in chunks 1-2, 47 Sidekick fire events (slot 3) in chunks 3-4, matching the test scenario (AR at south spawn, Sidekick at north spawn).
 
+## PvE (human + bot) film encoding
+
+When a bot is present, the frame encoding changes fundamentally. **Each bot frame carries BOTH entity positions:**
+
+- **Bot position**: byte-aligned at pos+11..14 (one-byte-shifted layout, `b9=0x35`, `b7=0x40`)
+- **Human position**: embedded sub-record at ~pos+34, **4-bit-shifted** (one nibble offset from byte alignment)
+
+The human's position is NOT in its own top-level frames. The byte-aligned `b8=0x4d b9=0x56` stream at pi=0 is a derived quantity (not human position) and must be ignored.
+
+### Embedded human sub-record
+
+```
+pos+0:  A0 7B 42                    ← standard marker
+pos+5:  40 09 40 05 35              ← bot frame header (b9=0x35)
+pos+10: 59 05 XX XX XX ...          ← bot coords (byte-aligned, current bot extractor)
+...
+pos+34: 10 0a 30                    ← SUB-RECORD MARKER (constant)
+pos+37: 15 64 YY ZZ WW ...          ← 4-bit-shifted human coords
+        │
+        └─ nibble decode: (0x15 & 0xF)<<4 | (0x64>>4) = 0x56  ← shifted "b9"
+                          (0x64 & 0xF)<<4 | (YY>>4) = 0x4?    ← shifted "d0"
+```
+
+**Decode formula**: `shiftByte(k) = ((chunk[base+k] & 0xF) << 4) | (chunk[base+k+1] >> 4)` where `base = pos + offset_of_10_0a_30 + 3`. Then `c1 = shiftByte(1)*256 + shiftByte(2)` and `c2 = ((shiftByte(3) & 0xF) << 8) | shiftByte(4)`, identical to standard encoding but on nibble-shifted bytes.
+
+**Presence**: Only ~25-30% of bot frames carry the human sub-record (those with `10 0a 30`). Others have `10 0a 20` or `10 0a 40` — different sub-record types without human coords. The byte at marker+3 must have low nibble = 5 (e.g. `0x15`) for shifted-b9 to decode as `0x56`.
+
+**Rare normal frames**: A handful (~7-15) of `pi=1 b7=0x00 b8=0x05 b9=0x56` standard-layout frames appear at the very start (before the bot spawns). These are merged into the human stream.
+
+**Validated in films `4bfdd8b9` and `b632adeb`**: human does a full loop. Embedded extraction gives cumRange c1≈275, c2≈2070, final≈(0,160) — matches solo loop shape with near-perfect closure.
+
+### Bot stream layout (unchanged)
+
+| Field | Standard (human, b7=0x00) | Bot (b7=0x40) |
+|---|---|---|
+| Layout marker | `p9 & 1 == 0` | `p9 & 1 == 1` |
+| High-nibble check | `(pos+10 >> 4) == 4` | `(pos+11 >> 4) == 0` |
+| coord1 (16-bit) | pos+10, pos+11 | pos+11, pos+12 |
+| coord2 (12-bit) | pos+12, pos+13 | pos+13, pos+14 |
+
+Extraction uses `extractPvEHumanEmbedded` for the human stream (nibble-shifted sub-records) and `extractBase09BotShifted` for the bot stream (byte-aligned pos+11..14).
+
 ## Things to know
 
 - `config.json` and `tokens.bin` are gitignored and contain secrets — never commit them.
 - The `objects.json` ID mapping is incomplete. New object IDs are discovered by creating Forge maps with known placements and correlating MVAR dumps.
-- Bot matches produce incorrect path output — this is a known issue under investigation.
 - The version number displayed in the CLI banner is read from `package.json` at runtime.

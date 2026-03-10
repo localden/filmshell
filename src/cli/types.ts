@@ -160,6 +160,7 @@ export interface BondDocument {
 // Multi-player motion data
 export interface PlayerPath {
   playerIndex: number;
+  isBot: boolean;        // true = extracted from b7=0x40 shifted stream (bot/AI entity)
   positions: MotionPoint[];
 }
 

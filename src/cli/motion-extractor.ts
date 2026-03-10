@@ -33,34 +33,106 @@ function buildFrameTypeHex(baseHex: string, playerIndex: number): string {
 }
 
 /**
- * Detect all players present in the film by scanning frame types.
- * Returns a sorted array of player indices found (e.g., [0] for single player, [0, 1] for two).
+ * Detect all entity streams present in the film by scanning frame types.
+ *
+ * An entity stream is a (playerIndex, isBot) pair. In bot/PvE films the
+ * same playerIndex can carry both a standard human stream (b7=0x00) and
+ * a shifted bot stream (b7=0x40), which must be extracted separately.
+ *
+ * Returns a sorted array of detected entities.
  */
 const MIN_PLAYER_FRAMES = 10;
 
-function detectPlayers(chunks: Buffer[]): number[] {
-  const playerCounts = new Map<number, number>();
+interface DetectedEntity {
+  playerIndex: number;
+  isBot: boolean;
+}
+
+function detectEntities(chunks: Buffer[]): DetectedEntity[] {
+  // Standard stream: b7==0x00 (or base 0x08 which has no b7 split) with d0hn==4
+  const standardCounts = new Map<number, number>();
+  // Bot shifted stream: b7==0x40, p9&1==1, d1hn==0
+  const shiftedCounts = new Map<number, number>();
 
   for (const chunk of chunks) {
     const markers = findMarkers(chunk);
     for (const pos of markers) {
-      if (pos + 8 >= chunk.length) continue;
-      const b0 = chunk[pos + 5];
-      const b1 = chunk[pos + 6];
-      // Only look at motion frame types (base 0x09 for XX0005, base 0x08 for XX8064)
-      const base = getBaseType(b1);
-      if (b0 === 0x40 && (base === 0x09 || base === 0x08)) {
-        const pi = getPlayerIndex(b1);
-        playerCounts.set(pi, (playerCounts.get(pi) || 0) + 1);
+      if (pos + 14 >= chunk.length) continue;
+      const byte5 = chunk[pos + 5];
+      const byte6 = chunk[pos + 6];
+      if (byte5 !== 0x40) continue;
+
+      const base = getBaseType(byte6);
+      const pi = getPlayerIndex(byte6);
+
+      if (base === 0x09) {
+        const byte7 = chunk[pos + 7];
+        if (byte7 === 0x00 && (chunk[pos + 10] >> 4) === 4) {
+          standardCounts.set(pi, (standardCounts.get(pi) || 0) + 1);
+        } else if (
+          byte7 === 0x40 &&
+          (chunk[pos + 9] & 0x01) === 1 &&
+          (chunk[pos + 11] >> 4) === 0
+        ) {
+          shiftedCounts.set(pi, (shiftedCounts.get(pi) || 0) + 1);
+        }
+      } else if (base === 0x08) {
+        // 40088064-style frames (no known bot variant)
+        standardCounts.set(pi, (standardCounts.get(pi) || 0) + 1);
       }
     }
   }
 
-  // Filter out spurious player indices with very few frames (noise)
-  return [...playerCounts.entries()]
-    .filter(([, count]) => count >= MIN_PLAYER_FRAMES)
-    .map(([pi]) => pi)
-    .sort((a, b) => a - b);
+  const entities: DetectedEntity[] = [];
+  for (const [pi, count] of standardCounts) {
+    if (count >= MIN_PLAYER_FRAMES) entities.push({ playerIndex: pi, isBot: false });
+  }
+  for (const [pi, count] of shiftedCounts) {
+    if (count >= MIN_PLAYER_FRAMES) entities.push({ playerIndex: pi, isBot: true });
+  }
+
+  return entities.sort(
+    (a, b) => a.playerIndex - b.playerIndex || Number(a.isBot) - Number(b.isBot)
+  );
+}
+
+/**
+ * Detect if this film uses the PvE embedded-human encoding.
+ * True if bot (b9=0x35) frames exist AND embedded '10 0a 30' sub-records
+ * with shifted-b9=0x56 are present in meaningful numbers.
+ */
+function detectPvEEmbeddedMode(chunks: Buffer[]): boolean {
+  let botFrames = 0;
+  let embeddedHuman = 0;
+
+  for (const chunk of chunks) {
+    const markers = findMarkers(chunk);
+    for (const pos of markers) {
+      if (pos + 45 >= chunk.length) continue;
+      const byte5 = chunk[pos + 5];
+      const byte6 = chunk[pos + 6];
+      if (byte5 !== 0x40 || getBaseType(byte6) !== 0x09) continue;
+      if (chunk[pos + 9] !== 0x35) continue;
+      botFrames++;
+
+      // Check for embedded human sub-record
+      for (let off = 30; off <= 38; off++) {
+        if (pos + off + 6 >= chunk.length) break;
+        if (chunk[pos + off] !== 0x10 || chunk[pos + off + 1] !== 0x0a || chunk[pos + off + 2] !== 0x30) {
+          continue;
+        }
+        const base = pos + off + 3;
+        const sb9 = ((chunk[base] & 0x0f) << 4) | (chunk[base + 1] >> 4);
+        const sd0 = ((chunk[base + 1] & 0x0f) << 4) | (chunk[base + 2] >> 4);
+        if (sb9 === 0x56 && (sd0 >> 4) === 4) embeddedHuman++;
+        break;
+      }
+
+      // Early exit once we have enough evidence
+      if (botFrames >= 50 && embeddedHuman >= MIN_PLAYER_FRAMES) return true;
+    }
+  }
+  return embeddedHuman >= MIN_PLAYER_FRAMES;
 }
 
 /**
@@ -186,6 +258,9 @@ function extractBase09Position(chunks: Buffer[], playerIndex: number): MotionPoi
       if (byte5 !== 0x40) continue;
       if (getPlayerIndex(byte6) !== playerIndex) continue;
       if (getBaseType(byte6) !== 0x09) continue;
+      // byte7 encodes entity stream type: 0x00=human standard, 0x05=camera/orbit,
+      // 0x40=bot shifted. Only accept the standard human stream here.
+      if (chunk[pos + 7] !== 0x00) continue;
 
       const b0 = chunk[pos + 10];
 
@@ -230,6 +305,208 @@ function extractBase09Position(chunks: Buffer[], playerIndex: number): MotionPoi
       prevC1 = c1;
       prevC2 = c2;
     }
+  }
+
+  return positions;
+}
+
+/**
+ * Extract positions from the bot/AI shifted stream (b7=0x40).
+ *
+ * Bot frames use a one-byte-shifted data layout relative to the standard
+ * human stream: coord bytes live at +11..+14 instead of +10..+13, signaled
+ * by p9 bit 0 = 1 and a high-nibble-0 check at pos+11 instead of the
+ * high-nibble-4 check at pos+10.
+ *
+ * @param chunks - Film chunk buffers
+ * @param playerIndex - Player index (0-7)
+ */
+function extractBase09BotShifted(chunks: Buffer[], playerIndex: number): MotionPoint[] {
+  const positions: MotionPoint[] = [];
+  let prevC1: number | null = null;
+  let prevC2: number | null = null;
+  let cumCoord1 = 0;
+  let cumCoord2 = 0;
+  let frameCount = 0;
+  const DISCONTINUITY_THRESHOLD = 4000;
+
+  for (const chunk of chunks) {
+    const markers = findMarkers(chunk);
+
+    for (const pos of markers) {
+      if (pos + 14 >= chunk.length) continue;
+
+      const byte5 = chunk[pos + 5];
+      const byte6 = chunk[pos + 6];
+
+      if (byte5 !== 0x40) continue;
+      if (getPlayerIndex(byte6) !== playerIndex) continue;
+      if (getBaseType(byte6) !== 0x09) continue;
+      if (chunk[pos + 7] !== 0x40) continue;           // bot/AI stream marker
+      if ((chunk[pos + 9] & 0x01) !== 1) continue;     // shifted-layout flag
+
+      const b0 = chunk[pos + 11];
+      // Shifted high-nibble check (mirrors the standard d0hn==4 filter)
+      if ((b0 >> 4) !== 0) continue;
+
+      const b1 = chunk[pos + 12];
+      const b2 = chunk[pos + 13];
+      const b3 = chunk[pos + 14];
+
+      const c1 = b0 * 256 + b1;
+      const c2 = ((b2 & 0x0f) << 8) | b3;
+
+      if (prevC1 !== null && prevC2 !== null) {
+        let delta1 = c1 - prevC1;
+        let delta2 = c2 - prevC2;
+
+        // 16-bit wraparound for coord1
+        if (delta1 > 32768) delta1 -= 65536;
+        if (delta1 < -32768) delta1 += 65536;
+
+        // 12-bit wraparound for coord2 (range 0-4095)
+        if (delta2 > 2048) delta2 -= 4096;
+        if (delta2 < -2048) delta2 += 4096;
+
+        // Skip discontinuities (spawn/death jumps)
+        if (Math.abs(delta1) > DISCONTINUITY_THRESHOLD) delta1 = 0;
+        if (Math.abs(delta2) > DISCONTINUITY_THRESHOLD) delta2 = 0;
+
+        cumCoord1 += delta1;
+        cumCoord2 += delta2;
+      }
+
+      // raw1 is normalized with a +0x4000 bias so its baseline aligns with the
+      // standard stream (where d0 high nibble is 4 → c1 ∈ 0x4000..0x4FFF).
+      // This lets scaleAllPlayersToWorld register bot and human paths in the
+      // same absolute coordinate space. Delta tracking uses local prevC1/c1
+      // and is unaffected by this offset.
+      positions.push({
+        frame: frameCount++,
+        cumCoord1,
+        cumCoord2,
+        raw1: c1 + 0x4000,
+        raw2: c2,
+      });
+
+      prevC1 = c1;
+      prevC2 = c2;
+    }
+  }
+
+  return positions;
+}
+
+/**
+ * Extract human positions from PvE (human + bot) films where human coords
+ * are embedded as a 4-BIT-SHIFTED SUB-RECORD inside each bot frame.
+ *
+ * In PvE films, the bot's presence changes the frame encoding: each bot frame
+ * (b9=0x35) carries the bot's own position at the usual pos+11..14 location,
+ * AND an embedded human-position sub-record ~34 bytes in, at a 4-bit (one
+ * nibble) offset from byte alignment.
+ *
+ * Sub-record structure:
+ *   pos+34: 10 0a 30           ← sub-record marker
+ *   pos+37: X5 64 YY ZZ WW ..  ← 4-bit-shifted human coords
+ *           └─ nibble-shift decode:
+ *              (X5 & 0xF)<<4 | (64>>4) = 0x56  (human b9 marker)
+ *              (64 & 0xF)<<4 | (YY>>4) = 0x4?  (d0, position channel)
+ *              ... then c1 = d0*256+d1, c2 = (d2&0xF)<<8|d3 as usual.
+ *
+ * Also merges the few "normal" pi=1 frames present before the bot spawns.
+ */
+function extractPvEHumanEmbedded(chunks: Buffer[]): MotionPoint[] {
+  const frames: Array<{ gp: number; c1: number; c2: number }> = [];
+  let globalPos = 0;
+  const DISCONTINUITY_THRESHOLD = 4000;
+
+  for (const chunk of chunks) {
+    const markers = findMarkers(chunk);
+    for (const pos of markers) {
+      if (pos + 45 >= chunk.length) continue;
+      const byte5 = chunk[pos + 5];
+      const byte6 = chunk[pos + 6];
+      if (byte5 !== 0x40 || getBaseType(byte6) !== 0x09) continue;
+
+      const pi = getPlayerIndex(byte6);
+      const b7 = chunk[pos + 7];
+      const b9 = chunk[pos + 9];
+
+      // Source A: Normal human frame at pi=1 — rare in PvE, only at match start
+      // before bot spawns. Same layout as Solo/PvP.
+      if (pi === 1 && b7 === 0x00 && b9 === 0x56 && (chunk[pos + 10] >> 4) === 4) {
+        const c1 = chunk[pos + 10] * 256 + chunk[pos + 11];
+        const c2 = ((chunk[pos + 12] & 0x0f) << 8) | chunk[pos + 13];
+        frames.push({ gp: globalPos + pos, c1, c2 });
+        continue;
+      }
+
+      // Source B: Embedded 4-bit-shifted sub-record inside bot (b9=0x35) frames.
+      // Scan a small window for the '10 0a 30' sub-record marker to tolerate
+      // layout drift across b8 variants (0x05 vs 0x15).
+      if (b9 === 0x35) {
+        for (let off = 30; off <= 38; off++) {
+          if (pos + off + 9 >= chunk.length) break;
+          if (chunk[pos + off] !== 0x10 || chunk[pos + off + 1] !== 0x0a || chunk[pos + off + 2] !== 0x30) {
+            continue;
+          }
+          // 4-bit-shift decode: shiftByte(k) = (b[k]_lo << 4) | b[k+1]_hi
+          const base = pos + off + 3;
+          const shiftByte = (k: number): number =>
+            ((chunk[base + k] & 0x0f) << 4) | (chunk[base + k + 1] >> 4);
+
+          const sb9 = shiftByte(0);
+          const sd0 = shiftByte(1);
+          // Validate: shifted b9 must be 0x56 (human marker), d0 hnib must be 4
+          if (sb9 !== 0x56 || (sd0 >> 4) !== 4) break;
+
+          const sd1 = shiftByte(2);
+          const sd2 = shiftByte(3);
+          const sd3 = shiftByte(4);
+          const c1 = sd0 * 256 + sd1;
+          const c2 = ((sd2 & 0x0f) << 8) | sd3;
+          frames.push({ gp: globalPos + pos + off, c1, c2 });
+          break; // one sub-record per bot frame
+        }
+      }
+    }
+    globalPos += chunk.length;
+  }
+
+  // Sort by byte position (NORM and NIB interleave across chunks)
+  frames.sort((a, b) => a.gp - b.gp);
+
+  // Convert to MotionPoint with cumulative deltas (same as extractBase09Position)
+  const positions: MotionPoint[] = [];
+  let prevC1: number | null = null;
+  let prevC2: number | null = null;
+  let cumCoord1 = 0;
+  let cumCoord2 = 0;
+
+  for (let i = 0; i < frames.length; i++) {
+    const { c1, c2 } = frames[i];
+    if (prevC1 !== null && prevC2 !== null) {
+      let delta1 = c1 - prevC1;
+      let delta2 = c2 - prevC2;
+      if (delta1 > 32768) delta1 -= 65536;
+      if (delta1 < -32768) delta1 += 65536;
+      if (delta2 > 2048) delta2 -= 4096;
+      if (delta2 < -2048) delta2 += 4096;
+      if (Math.abs(delta1) > DISCONTINUITY_THRESHOLD) delta1 = 0;
+      if (Math.abs(delta2) > DISCONTINUITY_THRESHOLD) delta2 = 0;
+      cumCoord1 += delta1;
+      cumCoord2 += delta2;
+    }
+    positions.push({
+      frame: i,
+      cumCoord1,
+      cumCoord2,
+      raw1: c1,
+      raw2: c2,
+    });
+    prevC1 = c1;
+    prevC2 = c2;
   }
 
   return positions;
@@ -329,6 +606,7 @@ function extractBase09_b3variant(chunks: Buffer[], playerIndex: number): MotionP
       if (byte5 !== 0x40) continue;
       if (getPlayerIndex(byte6) !== playerIndex) continue;
       if (getBaseType(byte6) !== 0x09) continue;
+      if (chunk[pos + 7] !== 0x00) continue;
 
       const b0 = chunk[pos + 10];
       // Only position-channel frames
@@ -425,6 +703,7 @@ function detectBase09Variant(chunks: Buffer[], playerIndex: number): {
       if (byte5 !== 0x40) continue;
       if (getPlayerIndex(byte6) !== playerIndex) continue;
       if (getBaseType(byte6) !== 0x09) continue;
+      if (chunk[pos + 7] !== 0x00) continue;
 
       const d0 = chunk[pos + 10];
       if ((d0 >> 4) !== 4) continue;
@@ -510,6 +789,7 @@ function countBase09PositionFrames(chunks: Buffer[], playerIndex: number): numbe
       if (byte5 !== 0x40) continue;
       if (getPlayerIndex(byte6) !== playerIndex) continue;
       if (getBaseType(byte6) !== 0x09) continue;
+      if (chunk[pos + 7] !== 0x00) continue;
       if ((chunk[pos + 10] >> 4) !== 4) continue;
       count++;
     }
@@ -582,22 +862,57 @@ export function extractRawPositions(
 }
 
 /**
- * Extract positions for all players detected in the film.
- * Returns an array of PlayerPath objects, one per player.
+ * Extract positions for all entity streams detected in the film.
+ * Returns an array of PlayerPath objects, one per (playerIndex, isBot) stream.
  */
 export function extractAllPlayerPositions(
   chunks: Buffer[],
   onStatus?: (msg: string) => void
 ): PlayerPath[] {
   const log = onStatus ?? ((msg: string) => console.log(dim(msg)));
-  const players = detectPlayers(chunks);
-  log(`Detected ${players.length} player(s) in film: [${players.join(', ')}]`);
+
+  // Detect PvE embedded-human mode (bot present → human coords are nibble-
+  // shifted sub-records inside bot frames, NOT top-level frames)
+  const isPvEEmbedded = detectPvEEmbeddedMode(chunks);
+
+  if (isPvEEmbedded) {
+    log('Detected PvE embedded-human encoding (bot present)');
+    const paths: PlayerPath[] = [];
+
+    // Human: 4-bit-shifted sub-records inside bot frames + rare pi=1 normal frames
+    const humanPositions = extractPvEHumanEmbedded(chunks);
+    log(`[P1] Using: PvE embedded sub-record (${humanPositions.length} frames)`);
+    if (humanPositions.length >= MIN_PLAYER_FRAMES) {
+      paths.push({ playerIndex: 0, isBot: false, positions: humanPositions });
+    }
+
+    // Bot: existing shifted extractor (pos+11..14) — this was correct all along
+    const botPositions = extractBase09BotShifted(chunks, 0);
+    log(`[Bot] Using: base-0x09 bot-shifted (${botPositions.length} frames)`);
+    if (botPositions.length >= MIN_PLAYER_FRAMES) {
+      paths.push({ playerIndex: 0, isBot: true, positions: botPositions });
+    }
+
+    return paths;
+  }
+
+  // Non-PvE: existing entity detection (Solo, PvP)
+  const entities = detectEntities(chunks);
+  const entityLabels = entities.map(e => e.isBot ? `${e.playerIndex}(bot)` : `${e.playerIndex}`);
+  log(`Detected ${entities.length} entity stream(s) in film: [${entityLabels.join(', ')}]`);
 
   const paths: PlayerPath[] = [];
-  for (const playerIndex of players) {
-    const positions = extractRawPositions(chunks, playerIndex, onStatus);
-    if (positions.length > 0) {
-      paths.push({ playerIndex, positions });
+  for (const { playerIndex, isBot } of entities) {
+    let positions: MotionPoint[];
+    if (isBot) {
+      positions = extractBase09BotShifted(chunks, playerIndex);
+      const prefix = playerIndex > 0 ? `[Bot${playerIndex + 1}] ` : '[Bot] ';
+      log(`${prefix}Using: base-0x09 bot-shifted (${positions.length} frames)`);
+    } else {
+      positions = extractRawPositions(chunks, playerIndex, onStatus);
+    }
+    if (positions.length >= MIN_PLAYER_FRAMES) {
+      paths.push({ playerIndex, isBot, positions });
     }
   }
 

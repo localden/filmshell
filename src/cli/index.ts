@@ -29,6 +29,7 @@ import {
   generateSvg,
   generateMultiPlayerSvg,
   getPlayerColor,
+  getBotColor,
 } from './svg-generator.js';
 import type { PlayerWorldPath } from './svg-generator.js';
 import {
@@ -224,12 +225,17 @@ async function processFilm(
 
   const rawPositions = playerPaths[0].positions;
 
-  motionSpinner.succeed(`${playerPaths.length} player(s), ${rawPositions.length} frames`);
+  motionSpinner.succeed(`${playerPaths.length} entity stream(s), ${rawPositions.length} frames`);
 
-  // Per-player stats
+  const entityLabel = (pp: { playerIndex: number; isBot: boolean }) =>
+    pp.isBot
+      ? `Bot${pp.playerIndex > 0 ? pp.playerIndex + 1 : ''}`
+      : `P${pp.playerIndex + 1}`;
+
+  // Per-entity stats
   for (const pp of playerPaths) {
     const stats = computeMotionStats(pp.positions, downloadedFilm.filmLengthMs);
-    detail(`P${pp.playerIndex + 1}`, `${stats.totalFrames} frames, range C1=${stats.rangeCoord1} C2=${stats.rangeCoord2}`);
+    detail(entityLabel(pp), `${stats.totalFrames} frames, range C1=${stats.rangeCoord1} C2=${stats.rangeCoord2}`);
   }
 
   const motionStats = computeMotionStats(rawPositions, downloadedFilm.filmLengthMs);
@@ -260,18 +266,18 @@ async function processFilm(
     const allWorldPositions = scaleAllPlayersToWorld(allRawPositions, mapBounds, spawnAnchor);
     playerWorldPaths = playerPaths.map((pp, idx) => ({
       playerIndex: pp.playerIndex,
-      label: `P${pp.playerIndex + 1}`,
+      label: entityLabel(pp),
       positions: allWorldPositions[idx],
-      color: getPlayerColor(pp.playerIndex),
+      color: pp.isBot ? getBotColor(pp.playerIndex) : getPlayerColor(pp.playerIndex),
     }));
   } else {
     playerWorldPaths = playerPaths.map(pp => {
       const worldPositions = scaleMotionToWorld(pp.positions, mapBounds, spawnAnchor);
       return {
         playerIndex: pp.playerIndex,
-        label: `P${pp.playerIndex + 1}`,
+        label: entityLabel(pp),
         positions: worldPositions,
-        color: getPlayerColor(pp.playerIndex),
+        color: pp.isBot ? getBotColor(pp.playerIndex) : getPlayerColor(pp.playerIndex),
       };
     });
   }

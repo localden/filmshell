@@ -261,33 +261,42 @@ export function scaleAllPlayersToWorld(
   let scaleY = DEFAULT_SCALE;
   const encodingAspect = ENCODING_RATIO * (mapBounds?.width ?? 1) / (mapBounds?.height ?? 1);
 
-  if (mapBounds && mapBounds.width > 0 && spawnAnchor && physExtentY > 0) {
+  if (mapBounds && mapBounds.width > 0 && spawnAnchor && allPlayerPositions[0].length > 0) {
     // Constraint-based: player 0's first frame anchors to spawnAnchor.
-    // Physical coords: physC1 = raw1 + cumC1, physC2 = raw2 + cumC2.
-    // World Y = physC1 * scaleY + offsetY, World X = -physC2 * scaleX + offsetX.
-    // With spawn anchor: offsetY = spawnAnchor.y - baselines[0].raw1 * scaleY,
-    //   so world Y = (physC1 - baselines[0].raw1) * scaleY + spawnAnchor.y for player 0 first frame.
-    // For ALL players: world Y = physC1 * scaleY + offsetY.
-    // Constraint: mapMinY ≤ world Y ≤ mapMaxY for all points.
+    // Scale is computed from PLAYER 0 ONLY so the anchored player's path
+    // fills the map — secondary entities (e.g. bots with wild trajectories)
+    // don't pinch the scale. They render at the same scale and may clip.
     const b0 = baselines[0];
+    let p0MinC1 = Infinity, p0MaxC1 = -Infinity;
+    let p0MinC2 = Infinity, p0MaxC2 = -Infinity;
+    for (const p of allPlayerPositions[0]) {
+      const physC1 = b0.raw1 + p.cumCoord1;
+      const physC2 = b0.raw2 + p.cumCoord2;
+      p0MinC1 = Math.min(p0MinC1, physC1);
+      p0MaxC1 = Math.max(p0MaxC1, physC1);
+      p0MinC2 = Math.min(p0MinC2, physC2);
+      p0MaxC2 = Math.max(p0MaxC2, physC2);
+    }
+    const p0ExtentY = p0MaxC1 - p0MinC1;
+    const p0ExtentX = p0MaxC2 - p0MinC2;
+
     // After anchoring, world Y = (physC1 - b0.raw1) * scaleY + spawnAnchor.y
-    // So physC1 extremes relative to anchor baseline:
-    const relMaxC1 = maxPhysC1 - b0.raw1;
-    const relMinC1 = minPhysC1 - b0.raw1;
+    const relMaxC1 = p0MaxC1 - b0.raw1;
+    const relMinC1 = p0MinC1 - b0.raw1;
     const spaceYPos = mapBounds.maxY - spawnAnchor.y;
     const spaceYNeg = spawnAnchor.y - mapBounds.minY;
-    const threshold = physExtentY * 0.05;
+    const threshold = p0ExtentY * 0.05;
 
     scaleY = Infinity;
     if (relMaxC1 > threshold) scaleY = Math.min(scaleY, spaceYPos / relMaxC1);
     if (-relMinC1 > threshold) scaleY = Math.min(scaleY, spaceYNeg / (-relMinC1));
 
     // X constraints: world X = -(physC2 - b0.raw2) * scaleX + spawnAnchor.x
-    const relMaxC2 = maxPhysC2 - b0.raw2;
-    const relMinC2 = minPhysC2 - b0.raw2;
+    const relMaxC2 = p0MaxC2 - b0.raw2;
+    const relMinC2 = p0MinC2 - b0.raw2;
     const spaceXNeg = spawnAnchor.x - mapBounds.minX;
     const spaceXPos = mapBounds.maxX - spawnAnchor.x;
-    const thresholdX = physExtentX * 0.05;
+    const thresholdX = p0ExtentX * 0.05;
 
     if (relMaxC2 > thresholdX) {
       scaleY = Math.min(scaleY, spaceXNeg * encodingAspect / relMaxC2);
@@ -308,7 +317,7 @@ export function scaleAllPlayersToWorld(
   const combinedCenterX = -(minPhysC2 + maxPhysC2) / 2 * scaleX;
   const combinedCenterY = (minPhysC1 + maxPhysC1) / 2 * scaleY;
 
-  // Compute a single offset (same for all players since physical coords are absolute)
+  // Compute player 0's (global) offset
   let offsetX: number;
   let offsetY: number;
 
@@ -326,13 +335,76 @@ export function scaleAllPlayersToWorld(
     offsetY = -combinedCenterY;
   }
 
+  // Determine if each secondary player's baseline is close enough to player 0's
+  // for shared-offset registration. If baselines differ by more than player 0's
+  // own cumCoord range, the streams aren't in the same physical coord space
+  // (e.g. PvE bot encoding) — center that player independently instead.
+  const b0 = baselines[0];
+  let p0Range1 = 0, p0Range2 = 0;
+  if (allPlayerPositions[0].length > 0) {
+    let min1 = Infinity, max1 = -Infinity, min2 = Infinity, max2 = -Infinity;
+    for (const p of allPlayerPositions[0]) {
+      min1 = Math.min(min1, p.cumCoord1); max1 = Math.max(max1, p.cumCoord1);
+      min2 = Math.min(min2, p.cumCoord2); max2 = Math.max(max2, p.cumCoord2);
+    }
+    p0Range1 = max1 - min1;
+    p0Range2 = max2 - min2;
+  }
+
   // Apply to each player using absolute physical coordinates
   return allPlayerPositions.map((positions, playerIdx) => {
     if (positions.length === 0) return [];
     const { raw1, raw2 } = baselines[playerIdx];
+
+    // Check baseline alignment with player 0
+    const baselineDrift1 = Math.abs(raw1 - b0.raw1);
+    const baselineDrift2 = Math.abs(raw2 - b0.raw2);
+    const aligned = playerIdx === 0 ||
+      (baselineDrift1 <= Math.max(p0Range1, 500) && baselineDrift2 <= Math.max(p0Range2, 500));
+
+    if (aligned) {
+      return positions.map(p => ({
+        x: -(raw2 + p.cumCoord2) * scaleX + offsetX,
+        y: (raw1 + p.cumCoord1) * scaleY + offsetY,
+        frame: p.frame,
+      }));
+    }
+
+    // Baseline misaligned — this entity's encoding is in a different physical
+    // coordinate space (e.g. PvE bot stream). Scale AND center independently.
+    let cMin1 = Infinity, cMax1 = -Infinity, cMin2 = Infinity, cMax2 = -Infinity;
+    for (const p of positions) {
+      cMin1 = Math.min(cMin1, p.cumCoord1); cMax1 = Math.max(cMax1, p.cumCoord1);
+      cMin2 = Math.min(cMin2, p.cumCoord2); cMax2 = Math.max(cMax2, p.cumCoord2);
+    }
+    const localExtentY = cMax1 - cMin1;
+    const localExtentX = cMax2 - cMin2;
+
+    // Independent constraint-based scale: fit BOTH axes within map bounds.
+    // Take the tighter constraint so neither axis overflows.
+    let lScaleY = scaleY;  // fall back to shared scale if no map bounds
+    let lScaleX = scaleX;
+    if (mapBounds && mapBounds.width > 0 && localExtentY > 0) {
+      const yConstraint = (mapBounds.height * MAP_FILL_FACTOR) / localExtentY;
+      // X constraint expressed in scaleY terms via encoding ratio:
+      //   scaleX = scaleY / encodingAspect, so (extentX * scaleX) ≤ width * fill
+      //   ⇒ scaleY ≤ width * fill * encodingAspect / extentX
+      const xConstraint = localExtentX > 0
+        ? (mapBounds.width * MAP_FILL_FACTOR * encodingAspect) / localExtentX
+        : Infinity;
+      lScaleY = Math.min(yConstraint, xConstraint);
+      lScaleX = lScaleY / encodingAspect;
+    }
+
+    const centerX = mapBounds?.centerX ?? 0;
+    const centerY = mapBounds?.centerY ?? 0;
+    const pathCenterX = -(cMin2 + cMax2) / 2 * lScaleX;
+    const pathCenterY = (cMin1 + cMax1) / 2 * lScaleY;
+    const localOffX = centerX - pathCenterX;
+    const localOffY = centerY - pathCenterY;
     return positions.map(p => ({
-      x: -(raw2 + p.cumCoord2) * scaleX + offsetX,
-      y: (raw1 + p.cumCoord1) * scaleY + offsetY,
+      x: -p.cumCoord2 * lScaleX + localOffX,
+      y: p.cumCoord1 * lScaleY + localOffY,
       frame: p.frame,
     }));
   });
@@ -616,22 +688,25 @@ export function generateMultiPlayerSvg(
     return createEmptySvg(matchId, 'Not enough position data');
   }
 
-  // Calculate view bounds from all paths AND map bounds
-  let viewMinX = Infinity, viewMaxX = -Infinity;
-  let viewMinY = Infinity, viewMaxY = -Infinity;
-
-  for (const p of allPositions) {
-    viewMinX = Math.min(viewMinX, p.x);
-    viewMaxX = Math.max(viewMaxX, p.x);
-    viewMinY = Math.min(viewMinY, p.y);
-    viewMaxY = Math.max(viewMaxY, p.y);
-  }
+  // View bounds: when map bounds exist, frame on them alone so wild secondary
+  // paths (e.g. imperfect bot extraction) can't shrink the map into a corner.
+  // Only fall back to path-extent when no map bounds.
+  let viewMinX: number, viewMaxX: number, viewMinY: number, viewMaxY: number;
 
   if (mapBounds && mapBounds.width > 0) {
-    viewMinX = Math.min(viewMinX, mapBounds.minX);
-    viewMaxX = Math.max(viewMaxX, mapBounds.maxX);
-    viewMinY = Math.min(viewMinY, mapBounds.minY);
-    viewMaxY = Math.max(viewMaxY, mapBounds.maxY);
+    viewMinX = mapBounds.minX;
+    viewMaxX = mapBounds.maxX;
+    viewMinY = mapBounds.minY;
+    viewMaxY = mapBounds.maxY;
+  } else {
+    viewMinX = Infinity; viewMaxX = -Infinity;
+    viewMinY = Infinity; viewMaxY = -Infinity;
+    for (const p of allPositions) {
+      viewMinX = Math.min(viewMinX, p.x);
+      viewMaxX = Math.max(viewMaxX, p.x);
+      viewMinY = Math.min(viewMinY, p.y);
+      viewMaxY = Math.max(viewMaxY, p.y);
+    }
   }
 
   // Add padding
@@ -801,10 +876,27 @@ export function generateMultiPlayerSvg(
 }
 
 /**
+ * Per-bot color palette — warm hues to contrast with the cool player palette
+ */
+const BOT_COLORS = [
+  '#ff6b6b', // coral
+  '#ffa94d', // soft orange
+  '#ffd43b', // warm yellow
+  '#ff8787', // light red
+];
+
+/**
  * Get a player color from the palette
  */
 export function getPlayerColor(playerIndex: number): string {
   return PLAYER_COLORS[playerIndex % PLAYER_COLORS.length];
+}
+
+/**
+ * Get a bot color from the palette
+ */
+export function getBotColor(playerIndex: number): string {
+  return BOT_COLORS[playerIndex % BOT_COLORS.length];
 }
 
 function createEmptySvg(matchId: string, message: string): string {
