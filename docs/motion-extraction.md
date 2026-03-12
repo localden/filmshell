@@ -274,3 +274,209 @@ Currently we render the bot at an independent scale (fitted to map bounds) rathe
 | **Nibble** | Half a byte (4 bits). One hex digit. |
 | **Nibble-shifted** | Data where the real byte boundaries are offset by 4 bits from the file's byte boundaries |
 | **Sub-record** | A mini-frame packed inside a bigger frame, with its own marker (`10 0A 30` for the human in PvE) |
+
+---
+
+# How We Figured This Out (Reverse-Engineering Methodology)
+
+None of the above was documented. Here's the process we used to discover it, written so someone else can do the same on a different format.
+
+## Step 0: Control the experiment
+
+The single most important thing: **record films where you know exactly what happened**.
+
+- Walk a precise path (one clockwise loop, start and end at the same spot).
+- Change exactly one variable per film (solo vs PvP vs PvE, same map, same route).
+- Do something distinctive in each phase (e.g., "walked straight north for 10 seconds, then turned east") so you can spot those phases in the data.
+
+A film of "I ran around randomly for 2 minutes" is almost useless. A film of "I walked from spawn A to spawn B in a straight line, then stood still for 5 seconds" is gold — you know the X should increase monotonically then go flat.
+
+## Step 1: Find the frame markers
+
+Position data repeats many times per second. If the film is a 60-second match and there are 60+ frames per second, there should be some 3-or-4-byte sequence that appears **thousands of times** — once per frame.
+
+**Technique**: Slide a window over the file and count every distinct 3-byte sequence. The one that appears way more than any other is your frame marker.
+
+```
+for i in 0..len-3:
+    triplet = bytes[i:i+3]
+    count[triplet] += 1
+sort counts descending → 'A0 7B 42' appears 5000+ times, next runner-up appears <100 times
+```
+
+Sanity check: if you found the right marker, the gaps between consecutive markers should be roughly consistent (tens to hundreds of bytes, not 1 byte or 50,000 bytes). Irregular gaps are normal (different frame types have different sizes), but you shouldn't see markers 2 bytes apart.
+
+## Step 2: Classify frames by header bytes
+
+Once you know where frames start, look at the first ~10 bytes after each marker. Make a histogram of each byte position:
+
+| offset | unique values seen | most common |
+|---|---|---|
+| +5 | 1 | `40` (always) ← structural constant |
+| +6 | 4 | `09`, `08`, `29`, `28` ← low variety = type field |
+| +7 | 3 | `00`, `40`, `05` ← also a type selector |
+| +9 | 8 | `56`, `35`, ... ← more variety, but still discrete |
+| +10 | 256 | full range ← this is data, not header |
+
+**Rule of thumb**: bytes with few distinct values are **structure** (type fields, flags). Bytes with many distinct values are **data** (positions, angles).
+
+Offset +10 having the full range tells you "data starts here." Offsets +5 through +9 having low variety tells you "these are frame-type bytes."
+
+## Step 3: Find the position channel
+
+Position data has a **signature**: it changes smoothly. A player walking moves a tiny amount between consecutive frames. If you plot byte values frame-to-frame, position data looks like a gentle ramp, while random data looks like noise.
+
+**Technique**: For each candidate byte offset (10, 11, 12, ...), compute the **average absolute delta** between consecutive frames:
+
+```
+for each offset k in 10..20:
+    deltas = [abs(frame[i+1][k] - frame[i][k]) for each consecutive pair]
+    print(k, mean(deltas), stddev(deltas))
+```
+
+| offset | mean |δ| | stddev | interpretation |
+|---|---|---|---|
+| 10 | 0.8 | 3.2 | smooth ← position byte! |
+| 11 | 12.4 | 45.1 | changes a lot per frame ← low byte of position (more sensitive) |
+| 12 | 1.1 | 4.8 | smooth ← also position |
+| 13 | 18.9 | 52.3 | low byte of the other coord |
+| 14 | 127.3 | 88.0 | random-looking ← NOT position (probably angle, state, or unrelated) |
+
+Offsets 10-13 are smooth. Offsets 10 and 12 are *very* smooth (high bytes — they only change when the low byte overflows). Offsets 11 and 13 change more but still correlate frame-to-frame. **That's your position block.**
+
+## Step 4: Figure out the bit widths and byte pairing
+
+You found 4 bytes of position data. But how do they combine? Is it two 16-bit numbers? One 32-bit number? Two 12-bit numbers packed funny?
+
+**Technique A — check high-nibble constancy**: If a byte's high nibble is always the same value (e.g., always 4), that nibble is probably a **marker**, not data. So `d0 = 0x4X` means the real data is only 12 bits (low nibble of d0 + full d1), and the `4` is a channel tag.
+
+**Technique B — plot the raw values**: Combine candidate byte pairs into numbers and plot them over time for a film where you walked a straight line.
+
+- If `(d0*256 + d1)` goes up smoothly and `(d2*256 + d3)` stays flat → you walked along the d0/d1 axis.
+- If both change, you walked diagonally. Try a film where you walked purely north.
+
+**Technique C — look for wraparound**: If `d1` jumps from 255 to 0 while `d0` increments by 1 at the same moment, they're a paired 16-bit number. If `d1` wraps but `d0` *doesn't* change, d0 is a separate field.
+
+In our case: `d2`'s high nibble varies but only takes values like {2,3,6,7,10,11,14,15} in bot streams — that's **not** random, it's structured. The low nibble of `d2` is the real data. So `X = (d2 & 0x0F) << 8 | d3` = 12-bit X.
+
+## Step 5: Verify with the loop-closure test
+
+**This is the most powerful test in the whole toolkit.** If the player walked a loop and ended where they started, the correct decode should give a cumulative position that **returns to nearly zero**.
+
+```
+decode all frames → compute cumulative deltas → last cumCoord ≈ (0, 0)?
+```
+
+- Got (2, -15)? Good enough — small drift is normal.
+- Got (4500, -128)? Something's wrong. Maybe you're including a wraparound that isn't one, or filtering out frames that matter, or your bit width is off by one.
+
+This test catches **almost every decode error** because errors compound. A single bad wraparound adds ±4096 to the cumulative — very visible.
+
+## Step 6: How we found the nibble shift (PvE)
+
+When we hit PvE films, the byte-aligned decode produced a path that didn't form a loop. Steps to diagnose:
+
+### 6a. Rule out the obvious
+
+First: is it a **filtering** problem? Maybe we're including frames from the wrong entity.
+
+- Split frames by every header byte and decode each subset separately.
+- If one subset gives a clean loop, that's your filter.
+- **Result**: No subset of byte-aligned frames gave a loop. So the data itself is wrong, not the filter.
+
+### 6b. Diff against the working case
+
+Take a Solo film (works) and a PvE film (broken) where the human did the **same thing**. Compare:
+
+| | Solo | PvE | Suspicious? |
+|---|---|---|---|
+| Human frames/sec | ~20 | ~5 | PvE has way fewer! Where did they go? |
+| Bot frames/sec | 0 | ~30 | Bot has tons of frames |
+| Human X range (raw) | 1300–3400 | 2400–3600 | Half the range missing! |
+
+The human appears to have **far fewer frames** in PvE, and the range is truncated. Meanwhile the bot has a suspiciously high frame count. **Hypothesis**: the bot's frames are carrying the human's data somewhere.
+
+### 6c. Search inside the bot frames
+
+The bot's frames are ~60 bytes long but we only read bytes 11-14. What's in the rest?
+
+**Technique**: Dump the full bot frame bytes for 10 consecutive frames and look for **smoothly-changing regions** (same trick as Step 3, but per-offset inside the bot frame):
+
+```
+for offset in 10..55:
+    mean_delta = mean(|frame[i+1][offset] - frame[i][offset]| for i in consecutive pairs)
+```
+
+We found **two** smooth regions:
+- Offsets 11-14 (the bot's own position — already known)
+- Offsets ~38-42 — another smooth region!
+
+### 6d. Recognize the structure in the second region
+
+Dumped bytes around offset 38 for a handful of frames:
+
+```
+34  35  36  37  38  39  40
+10  0a  30  15  64  08  c6  ← frame 1
+10  0a  30  15  64  08  d2  ← frame 2  (only byte 40 changes slightly)
+10  0a  30  15  64  08  e0  ← frame 3
+```
+
+`10 0A 30` is constant — **that's a marker**. `15 64` is mostly constant — smells like a header. The changing bytes are further in.
+
+### 6e. Discover the nibble shift
+
+The key observation: byte 37 is always `0x15` and byte 38 is always `0x64`. Those specific values look boring. But:
+
+```
+(0x15 & 0x0F) = 5,  (0x64 >> 4) = 6  → combine: 5<<4 | 6 = 0x56
+```
+
+`0x56` is the **exact marker byte** (b9) for human frames in solo films! And:
+
+```
+(0x64 & 0x0F) = 4,  (next byte >> 4) = ?  → combine: 4<<4 | ? = 0x4?
+```
+
+`0x4?` is the d0 pattern for human position frames (high nibble = 4)!
+
+**The human frame header is there, just offset by half a byte.** Once you see it, you can't unsee it. Apply the nibble-shift decode and suddenly the loop-closure test passes.
+
+### 6f. Why look for a nibble shift at all?
+
+We didn't immediately guess "nibble shift." We first tried:
+
+- Every byte offset (38, 39, 40, ...) as the start of human data → none gave a loop
+- XORing with various constants → no luck
+- Big-endian vs little-endian → no luck
+
+The breakthrough was noticing the **constant bytes** (`15`, `64`) and asking "what if I recombine them differently?" When `(15 & 0xF)<<4 | (64>>4) = 0x56` matched a known marker, that was the eureka moment. General principle: **constant bytes next to data are often markers — if the byte values don't match a known marker, try nibble-recombining them.**
+
+## Step 7: Falsifying the wrong hypotheses
+
+Reverse engineering produces a lot of "maybe it's this?" moments. Kill bad hypotheses fast:
+
+**The byte-aligned `b8=0x4d` stream looked like the human but wasn't.** How we proved it:
+
+1. **Range test**: Its X values never went below 2413, but the Solo human's X hits ~1300 during the north leg. A correct decode should cover the same range as Solo. FAIL.
+
+2. **Correlation test**: If stream A and stream B are the same entity, `A[t] - B[t]` should be roughly constant. We compared b8=4d frames to embedded-sub-record frames at the same timestamps — the offset **drifted** (from +237 to +80 over the match). Two entities moving independently give a drifting offset. SAME-ENTITY HYPOTHESIS FAIL.
+
+3. **Loop-closure test**: Solo closes the loop at (-11, -73). Embedded sub-record closes at (0, 163). b8=4d doesn't close at all (ends 600+ units away from start). FAIL.
+
+Three independent failures = that stream is definitively not the human.
+
+## General heuristics cheat sheet
+
+| If you see… | It probably means… |
+|---|---|
+| A byte that's always the same value | Structural constant / marker |
+| A byte with 2-8 distinct values | Type selector / flags |
+| A byte that uses the full 0-255 range | Data (position, angle, timestamp) |
+| Two bytes where one wraps 255→0 as the other increments | They're a paired 16-bit number |
+| A byte whose high nibble is constant but low nibble varies | 4-bit marker + 4-bit data, or the low nibble is the real high nibble of a 12-bit field |
+| Smooth frame-to-frame deltas (mean δ < 10) | Continuous physical quantity (position, look angle) |
+| Noisy deltas (mean δ > 50) | Unrelated field, or the low byte of a fast-changing quantity |
+| Constant bytes that don't match any known marker | Try nibble-recombining with neighbors — might be bit-shifted |
+| Your known-loop path doesn't close | Wrong bit width, wrong wraparound threshold, or mixing multiple entity streams |
+| Fewer frames than expected for one entity, more for another | Data may be packed into the other entity's frames |
